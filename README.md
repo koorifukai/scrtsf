@@ -36,6 +36,11 @@ The line along the bottom shows the actual camera frame dimensions and whether
 that PC has recently decoded the opposite screen. If either side says
 "looking for screen", adjust its camera's view of the other display. The camera
 index and resolution can be changed by stopping and restarting the session.
+If a camera delivers a horizontally mirrored image, select **Flip camera input
+horizontally** on that PC and restart the session. Set it independently on each
+PC; it changes the camera image used for decoding, not the outgoing display.
+The option has no effect in debug loopback or on a no-ACK sender (which does
+not use a camera).
 
 Try a different camera index (0, 1, ...) if the wrong camera opens. The
 resolution is a request to the camera, not a guarantee. A 1080p camera and

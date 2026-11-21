@@ -51,7 +51,7 @@ class Camera:
         self.capture.release()
 
 
-def run_link(machine, camera_index, resolution, screen):
+def run_link(machine, camera_index, resolution, screen, mirror_camera=False):
     camera = None if isinstance(machine, NoAckSender) else Camera(camera_index, *resolution)
     window = "ScreenTransfer"
     started = time.monotonic()
@@ -73,7 +73,7 @@ def run_link(machine, camera_index, resolution, screen):
             if frame is not None and timestamp != last_seen:
                 last_seen = timestamp
                 try:
-                    decoded = visual.decode(frame)
+                    decoded = visual.decode(cv2.flip(frame, 1) if mirror_camera else frame)
                 except ValueError:
                     decoded = None
                 if decoded is not None:
@@ -182,6 +182,7 @@ def main():
     role = tk.StringVar(value="send")
     camera = tk.StringVar(value="0")
     resolution = tk.StringVar(value="1280 x 720")
+    mirror_camera = tk.BooleanVar(value=False)
     directory = tk.StringVar()
     no_ack = tk.BooleanVar(value=False)
     debug = tk.BooleanVar(value=False)
@@ -205,6 +206,8 @@ def main():
     ttk.Label(options, text="Requested resolution").grid(row=0, column=2)
     ttk.Combobox(options, textvariable=resolution, values=("1280 x 720", "1920 x 1080", "640 x 480"),
                  state="readonly", width=16).grid(row=0, column=3, padx=8)
+    ttk.Checkbutton(options, text="Flip camera input horizontally", variable=mirror_camera).grid(
+        row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
     modes = ttk.Frame(container)
     modes.pack(fill="x", pady=(0, 8))
     ttk.Checkbutton(modes, text="No ACK (select on both PCs)", variable=no_ack).grid(row=0, column=0, sticky="w")
@@ -268,7 +271,8 @@ def main():
                         raise ValueError("Invalid camera resolution")
             root.withdraw()
             root.update()
-            result = run_debug(paths, noise.get(), screen) if debug.get() else run_link(machine, index, dims, screen)
+            result = (run_debug(paths, noise.get(), screen) if debug.get()
+                      else run_link(machine, index, dims, screen, mirror_camera.get()))
             root.deiconify()
             messagebox.showinfo("ScreenTransfer", result, parent=root)
         except (OSError, ValueError, RuntimeError, cv2.error) as exc:

@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +11,7 @@ import numpy as np
 from scrtsf import app
 from scrtsf import protocol as p
 from scrtsf import simulation, visual
-from scrtsf.session import NoAckSender, Receiver, Sender
+from scrtsf.session import NO_ACK_META, NoAckSender, Receiver, Sender
 
 
 class OpticalTests(unittest.TestCase):
@@ -50,6 +51,39 @@ class OpticalTests(unittest.TestCase):
 
 
 class SessionTests(unittest.TestCase):
+    def test_camera_mirror_option_for_sender_and_receiver(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "empty.txt"
+            source.write_bytes(b"")
+            for mirror in (False, True):
+                for role in ("sender", "receiver"):
+                    with self.subTest(mirror=mirror, role=role):
+                        if role == "sender":
+                            machine = Sender([source], time.monotonic())
+                            data = p.packet(p.STATUS, machine.session, 0, p.encode_json({"state": "hello"}))
+                        else:
+                            dest = root / f"dest-{mirror}"
+                            dest.mkdir()
+                            machine = Receiver(dest, no_ack=True)
+                            meta, _ = p.prepare(source)
+                            data = p.packet(NO_ACK_META, b"12345678", 0, p.encode_json(meta))
+                        image = visual.render(data, 0, (1280, 720))
+                        if mirror:
+                            image = cv2.flip(image, 1)
+                        with patch.object(app, "Camera") as camera, \
+                             patch.object(app.cv2, "namedWindow"), \
+                             patch.object(app.cv2, "setWindowProperty"), \
+                             patch.object(app.cv2, "imshow"), \
+                             patch.object(app.cv2, "waitKey", return_value=27), \
+                             patch.object(app.cv2, "destroyAllWindows"):
+                            camera.return_value.latest.return_value = (image, time.monotonic())
+                            app.run_link(machine, 0, (1280, 720), (1280, 720), mirror)
+                        if role == "sender":
+                            self.assertEqual(machine.state, "cal")
+                        else:
+                            self.assertEqual((dest / source.name).read_bytes(), b"")
+
     def test_no_ack_sender_does_not_open_camera(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "file"
