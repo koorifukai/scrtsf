@@ -11,7 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 import numpy as np
 
-from . import simulation, visual
+from . import diagnostics, simulation, visual
 from .session import FRAME_SECONDS, NoAckSender, Receiver, Sender
 
 
@@ -208,6 +208,20 @@ def main():
                  state="readonly", width=16).grid(row=0, column=3, padx=8)
     ttk.Checkbutton(options, text="Flip camera input horizontally", variable=mirror_camera).grid(
         row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    def analyze_photo():
+        path = filedialog.askopenfilename(parent=root, title="Select a camera photo",
+                                          filetypes=(("Images", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")))
+        if not path:
+            return
+        try:
+            report = diagnostics.inspect_image(diagnostics.load_image(path), mirror_camera.get())
+            messagebox.showinfo("Photo diagnostics", report, parent=root)
+        except (OSError, ValueError, cv2.error) as exc:
+            messagebox.showerror("Photo diagnostics", str(exc), parent=root)
+
+    ttk.Button(options, text="Analyze camera photo...", command=analyze_photo).grid(
+        row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
     modes = ttk.Frame(container)
     modes.pack(fill="x", pady=(0, 8))
     ttk.Checkbutton(modes, text="No ACK (select on both PCs)", variable=no_ack).grid(row=0, column=0, sticky="w")

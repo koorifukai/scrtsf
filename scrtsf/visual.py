@@ -94,7 +94,7 @@ def render(data: bytes, profile_id: int, screen: tuple[int, int], label: str = "
     return canvas
 
 
-def decode(image):
+def locate(image):
     corners, ids, _ = DETECTOR.detectMarkers(image)
     if ids is None:
         raise ValueError("Looking for four markers")
@@ -110,21 +110,45 @@ def decode(image):
                       [MARGIN, p.height - MARGIN - 1]])
     transform = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(image, transform, (p.width, p.height))
+    return profile_id, src, warped
+
+
+def sample_grid(warped, p, shifted=False):
     x = y = MARGIN + MARKER + GAP
     grid = warped[y:y + p.rows * CELL, x:x + p.cols * CELL]
-    samples = grid.reshape(p.rows, CELL, p.cols, CELL, 3)[:, 2:6, :, 2:6, :].mean(axis=(1, 3))
+    cells = grid.reshape(p.rows, CELL, p.cols, CELL, 3)
+    if shifted:
+        samples = cells[:, 3:6, :, 4:7, :].mean(axis=(1, 3))
+    else:
+        samples = cells[:, 2:6, :, 2:6, :].mean(axis=(1, 3))
     if not p.color:
         samples = cv2.cvtColor(samples.astype(np.uint8), cv2.COLOR_BGR2GRAY)[:, :, None]
+    return samples
+
+
+def decode_samples(samples, p, threshold_fraction=0.5):
     low = np.percentile(samples, 15, axis=(0, 1))
     high = np.percentile(samples, 85, axis=(0, 1))
     if np.any(high - low < 40):
         raise ValueError("Insufficient contrast")
-    bits = (samples > (low + high) / 2).astype(np.uint8).reshape(-1)
+    bits = (samples > low + (high - low) * threshold_fraction).astype(np.uint8).reshape(-1)
     raw = np.packbits(bits)[:p.words * 255]
     raw = np.bitwise_xor(raw, _mask(raw.size)).reshape(255, p.words).T
     codec = reedsolo.RSCodec(PARITY)
     try:
         data = b"".join(bytes(codec.decode(row.tobytes())[0]) for row in raw)
-        return profile_id, protocol.unpack(data)
+        return protocol.unpack(data)
     except (reedsolo.ReedSolomonError, ValueError, IndexError) as exc:
         raise ValueError("Frame could not be decoded") from exc
+
+
+def decode(image):
+    profile_id, _, warped = locate(image)
+    p = PROFILES[profile_id]
+    try:
+        packet = decode_samples(sample_grid(warped, p), p)
+    except ValueError:
+        if p.color:
+            raise
+        packet = decode_samples(sample_grid(warped, p, shifted=True), p, 0.7)
+    return profile_id, packet

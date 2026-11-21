@@ -79,6 +79,16 @@ The receiver verifies files in temporary storage, which is deleted when the
 debug run ends. Esc stops the run. The simulation does not establish real
 camera performance.
 
+### Analyze a camera photo
+
+Click **Analyze camera photo...** in the setup window and choose an image from
+the camera. Set **Flip camera input horizontally** first if the actual camera
+frames need flipping. The report shows marker IDs, profile, approximate camera
+pixels per cell, data-cell brightness, expected padding and whether the packet
+passed its checksum. Photos stay on your PC. A dark strip at the end of the
+grid may be unused padding, not damaged data. A single still image cannot
+establish transfer performance or diagnose all camera and screen effects.
+
 The receiver refuses to overwrite an existing file and reports the error to the
 sender. Files are saved only after their size and SHA-256 checksum are verified.
 Incomplete transfers are held in memory and are lost when the application
@@ -92,7 +102,9 @@ uses monochrome or eight-color cells, corner markers, perspective correction,
 interleaved Reed-Solomon error correction, and packet CRCs. Calibration selects
 the profile with the best measured usable block rate; it can fall back to a
 less dense profile if progress stalls. Camera frame rate and resolution are not
-automatically tuned.
+automatically tuned. If normal monochrome sampling fails, the decoder retries
+with a shifted sampling area and a higher threshold; the packet must still
+pass its CRC.
 
 Files are compressed with zlib only when this makes them smaller. The receiver
 reports missing blocks in windows of 32; the sender retransmits them until

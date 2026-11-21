@@ -8,13 +8,45 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from scrtsf import app
+from scrtsf import app, diagnostics
 from scrtsf import protocol as p
 from scrtsf import simulation, visual
 from scrtsf.session import NO_ACK_META, NoAckSender, Receiver, Sender
 
 
 class OpticalTests(unittest.TestCase):
+    def test_shifted_mono_cells_recover_with_fallback(self):
+        profile = visual.PROFILES[0]
+        payload = np.random.default_rng(42).bytes(450)
+        packet = p.packet(p.DATA, b"12345678", 42, payload)
+        image = visual.render(packet, 0, (profile.width, profile.height + 36))
+        origin = visual.MARGIN + visual.MARKER + visual.GAP
+        height, width = profile.rows * visual.CELL, profile.cols * visual.CELL
+        grid = image[origin:origin + height, origin:origin + width].copy()
+        grid = cv2.warpAffine(grid, np.float32([[1, 0, 4], [0, 1, 0]]),
+                              (width, height), borderValue=(255, 255, 255))
+        image[origin:origin + height, origin:origin + width] = cv2.GaussianBlur(grid, (5, 5), 0.6)
+        _, _, warped = visual.locate(image)
+        with self.assertRaises(ValueError):
+            visual.decode_samples(visual.sample_grid(warped, profile), profile)
+        self.assertEqual(visual.decode(image), (0, p.unpack(packet)))
+
+    def test_photo_diagnostics_detect_mirrored_frame_and_padding(self):
+        packet = p.packet(p.HELLO, b"12345678", 12)
+        image = cv2.flip(visual.render(packet, 0, (1280, 720)), 1)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "\u753b\u50cf.png"
+            ok, encoded = cv2.imencode(".png", image)
+            self.assertTrue(ok)
+            encoded.tofile(str(path))
+            loaded = diagnostics.load_image(path)
+        wrong = diagnostics.inspect_image(loaded)
+        self.assertIn("Looking for four markers", wrong)
+        report = diagnostics.inspect_image(loaded, mirror=True)
+        self.assertIn("Marker IDs detected: 0, 1, 2, 3", report)
+        self.assertIn("Unused padding: 1048 of 7168", report)
+        self.assertIn("decoded and CRC verified (hello", report)
+
     def test_interleaved_error_correction_recovers_damaged_cells(self):
         profile = visual.PROFILES[0]
         data = p.packet(p.DATA, b"12345678", 5, os.urandom(300))
