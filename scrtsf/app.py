@@ -1,29 +1,64 @@
-"""Tkinter setup and the fullscreen OpenCV session."""
+"""Tkinter setup and windowed OpenCV sessions."""
 
 import ctypes
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
-import numpy as np
 
-from . import diagnostics, simulation, visual
-from .session import FRAME_SECONDS, NoAckSender, Receiver, Sender
+from . import visual
+from .calibration import FRAME_SECONDS, PATTERN_DURATION, PatternReceiver, PatternSender
+from .display import OpticalWindow
+from .session import NoAckSender, Receiver, Sender
+
+
+def configure_camera(capture, resolution=None, clock=time.monotonic):
+    if resolution is not None:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, resolution[0])
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
+        return
+    capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    choices = []
+    for width, height in ((640, 480), (1280, 720), (1920, 1080)):
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ok, _ = capture.read()
+        if not ok:
+            continue
+        started = clock()
+        frames = []
+        for _ in range(4):
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(frame)
+        if len(frames) != 4:
+            continue
+        rate = len(frames) / max(0.001, clock() - started)
+        actual_height, actual_width = frames[-1].shape[:2]
+        choices.append((rate >= 12, actual_width * actual_height, min(rate, 60), width, height))
+    if not choices:
+        raise RuntimeError("No camera mode delivered test frames. Check camera permissions and availability.")
+    _, _, _, width, height = max(choices)
+    capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
 
 class Camera:
-    def __init__(self, index, width, height):
+    def __init__(self, index, width=None, height=None):
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         self.capture = cv2.VideoCapture(index, backend)
         if not self.capture.isOpened():
             self.capture.release()
             raise RuntimeError(f"Could not open camera {index}. Check the index and Windows camera permissions.")
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        try:
+            configure_camera(self.capture, (width, height) if width is not None and height is not None else None)
+        except (RuntimeError, cv2.error):
+            self.capture.release()
+            raise
         self.lock = threading.Lock()
         self.frame = None
         self.timestamp = 0.0
@@ -51,17 +86,17 @@ class Camera:
         self.capture.release()
 
 
-def run_link(machine, camera_index, resolution, screen, mirror_camera=False):
-    camera = None if isinstance(machine, NoAckSender) else Camera(camera_index, *resolution)
+def run_link(machine, camera_index, resolution, screen):
+    camera = None if isinstance(machine, NoAckSender) else Camera(camera_index, *(resolution or ()))
     window = "ScreenTransfer"
     started = time.monotonic()
     last_seen = 0.0
     last_decoded = 0.0
     next_frame = 0.0
     display = None
+    decode_issue = "Find all 4 anchors"
     try:
-        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        optical = OpticalWindow(window, screen)
         while True:
             now = time.monotonic()
             frame, timestamp = camera.latest() if camera else (None, 0)
@@ -73,9 +108,13 @@ def run_link(machine, camera_index, resolution, screen, mirror_camera=False):
             if frame is not None and timestamp != last_seen:
                 last_seen = timestamp
                 try:
-                    decoded = visual.decode(cv2.flip(frame, 1) if mirror_camera else frame)
-                except ValueError:
+                    decoded = visual.decode(frame)
+                except ValueError as exc:
                     decoded = None
+                    decode_issue = {
+                        "Frame could not be decoded": "Unclear image: steady camera",
+                        "Insufficient contrast": "Low contrast: reduce glare",
+                    }.get(str(exc), str(exc))
                 if decoded is not None:
                     last_decoded = now
                     try:
@@ -96,15 +135,18 @@ def run_link(machine, camera_index, resolution, screen, mirror_camera=False):
                     profile, data = machine.frame()
                 if camera:
                     camera_size = f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "starting"
-                    link = "screen decoded" if now - last_decoded < 3 and last_decoded else "looking for screen"
-                    label = f"{machine.label()} | camera {camera_size}: {link}"
+                    link = "OK" if now - last_decoded < 3 and last_decoded else decode_issue
+                    if isinstance(machine, Sender) and now - machine.last_ack >= 8:
+                        link = "ACK lost: check peer screen"
+                    label = f"{machine.label()} | Cam {camera_size} {link}"
                 else:
                     label = machine.label()
-                display = visual.render(data, profile, screen, label)
-                next_frame = now + FRAME_SECONDS
-            if display is not None:
-                cv2.imshow(window, display)
-            if cv2.waitKey(1) & 0xFF == 27:
+                display = (profile, data, label)
+                resized = optical.show(*display)
+                if resized and isinstance(machine, Sender) and machine.state == "data":
+                    machine.start_calibration(resuming=True)
+                next_frame = time.monotonic() + machine.frame_interval
+            if cv2.waitKey(1) & 0xFF == 27 or optical.closed():
                 if isinstance(machine, Receiver):
                     return f"Stopped. Files saved: {len(machine.saved)}."
                 if isinstance(machine, NoAckSender):
@@ -116,124 +158,82 @@ def run_link(machine, camera_index, resolution, screen, mirror_camera=False):
         cv2.destroyAllWindows()
 
 
-def run_debug(paths, level, screen):
-    rng = np.random.default_rng()
-    attempts = [0, 0]
-    successes = [0, 0]
-    with tempfile.TemporaryDirectory(prefix="scrtsf-debug-") as directory:
-        sender = Sender(paths, time.monotonic())
-        receiver = Receiver(directory)
-        window = "ScreenTransfer debug loopback"
-        preview = "Simulated camera"
-        try:
-            cv2.namedWindow(window, cv2.WINDOW_NORMAL)
-            cv2.setWindowProperty(window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            cv2.namedWindow(preview, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(preview, 640, 360)
-            while True:
-                now = time.monotonic()
-                profile, data = sender.frame(now)
-                label = (f"DEBUG {level} | data {successes[0]}/{attempts[0]} "
-                         f"ACK {successes[1]}/{attempts[1]} | {sender.label()}")
-                display = visual.render(data, profile, screen, label)
-                camera_image = simulation.distort(display, level, rng)
-                attempts[0] += 1
+def show_calibration(screen):
+    sender = PatternSender()
+    try:
+        optical = OpticalWindow("ScreenTransfer - Show calib imgs", screen)
+        next_frame = 0.0
+        while True:
+            if time.monotonic() >= next_frame:
+                slot = sender.slot
+                profile, data = sender.frame()
+                label = f"Calibration {slot + 1}/{len(sender.frames)} | {visual.PROFILES[profile].label} | Esc: stop"
+                optical.show(profile, data, label)
+                next_frame = time.monotonic() + FRAME_SECONDS
+            if cv2.waitKey(10) & 0xFF == 27 or optical.closed():
+                return
+    finally:
+        cv2.destroyAllWindows()
+
+
+def take_calibration(camera_index, resolution):
+    camera = Camera(camera_index, *(resolution or ()))
+    receiver = PatternReceiver()
+    window = "ScreenTransfer - Take calib"
+    started = time.monotonic()
+    deadline = None
+    last_seen = None
+    try:
+        cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window, 800, 600)
+        while True:
+            now = time.monotonic()
+            frame, timestamp = camera.latest()
+            if now - (timestamp or started) > 8:
+                raise RuntimeError("The camera is not delivering frames.")
+            if frame is not None and timestamp != last_seen:
+                last_seen = timestamp
+                if deadline is None:
+                    deadline = now + PATTERN_DURATION
                 try:
-                    decoded = visual.decode(camera_image)
+                    decoded = visual.decode(frame)
+                except visual.AnchorsNotFound:
+                    pass
                 except ValueError:
-                    decoded = None
-                if decoded is not None:
+                    receiver.saw_anchors = True
+                else:
                     receiver.handle(decoded)
-                    successes[0] += 1
-                if receiver.state == "error":
-                    raise RuntimeError(f"Simulated receiver: {receiver.message}")
-                ack_profile, ack = receiver.frame()
-                ack_image = simulation.distort(visual.render(ack, ack_profile, screen), level, rng)
-                attempts[1] += 1
-                try:
-                    decoded_ack = visual.decode(ack_image)
-                except ValueError:
-                    decoded_ack = None
-                if decoded_ack is not None:
-                    sender.handle(decoded_ack, time.monotonic())
-                    successes[1] += 1
-                cv2.imshow(window, display)
-                cv2.imshow(preview, camera_image)
-                if sender.done:
-                    return (f"Debug complete: {len(receiver.saved)} file(s) verified in temporary storage.\n"
-                            f"Data frames: {successes[0]}/{attempts[0]}; ACK frames: {successes[1]}/{attempts[1]}.")
-                if cv2.waitKey(max(1, int((FRAME_SECONDS - (time.monotonic() - now)) * 1000))) & 0xFF == 27:
-                    return (f"Debug stopped. {len(receiver.saved)} file(s) verified.\n"
-                            f"Data frames: {successes[0]}/{attempts[0]}; ACK frames: {successes[1]}/{attempts[1]}.")
-        finally:
-            cv2.destroyAllWindows()
+                result = receiver.result(finished=time.monotonic() >= deadline)
+                if result is not None:
+                    return result
+                preview = frame.copy()
+                status = f"Scanning calibration | {max(1, int(deadline - now + 1))}s left | Esc: stop"
+                cv2.putText(preview, status, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.imshow(window, preview)
+            if cv2.waitKey(10) & 0xFF == 27 or (last_seen is not None and cv2.getWindowProperty(window, cv2.WND_PROP_VISIBLE) < 1):
+                return None
+            if deadline is not None and now >= deadline:
+                return receiver.result(finished=True)
+    finally:
+        camera.close()
+        cv2.destroyAllWindows()
 
 
-def main():
+def create_root(title):
     if sys.platform == "win32":
         try:
             ctypes.windll.user32.SetProcessDPIAware()
         except (AttributeError, OSError):
             pass
     root = tk.Tk()
-    root.title("ScreenTransfer setup")
-    root.minsize(570, 430)
-    screen = (root.winfo_screenwidth(), root.winfo_screenheight())
-    role = tk.StringVar(value="send")
-    camera = tk.StringVar(value="0")
-    resolution = tk.StringVar(value="1280 x 720")
-    mirror_camera = tk.BooleanVar(value=False)
-    directory = tk.StringVar()
-    no_ack = tk.BooleanVar(value=False)
-    debug = tk.BooleanVar(value=False)
-    profile = tk.StringVar(value=visual.PROFILES[0].name)
-    noise = tk.StringVar(value="Medium")
+    root.title(title)
+    return root
+
+
+def add_file_queue(container):
     paths = []
-
-    container = ttk.Frame(root, padding=16)
-    container.pack(fill="both", expand=True)
-    ttk.Label(container, text="ScreenTransfer", font=("Segoe UI", 16, "bold")).pack(anchor="w")
-    ttk.Label(container, text="Set up both PCs, or run a local simulated loopback.").pack(anchor="w", pady=(2, 10))
-    roles = ttk.Frame(container)
-    roles.pack(fill="x")
-    ttk.Radiobutton(roles, text="Sender", variable=role, value="send").pack(side="left")
-    ttk.Radiobutton(roles, text="Receiver", variable=role, value="receive").pack(side="left", padx=12)
-
-    options = ttk.Frame(container)
-    options.pack(fill="x", pady=10)
-    ttk.Label(options, text="Camera index").grid(row=0, column=0, sticky="w")
-    ttk.Entry(options, textvariable=camera, width=6).grid(row=0, column=1, padx=(8, 24))
-    ttk.Label(options, text="Requested resolution").grid(row=0, column=2)
-    ttk.Combobox(options, textvariable=resolution, values=("1280 x 720", "1920 x 1080", "640 x 480"),
-                 state="readonly", width=16).grid(row=0, column=3, padx=8)
-    ttk.Checkbutton(options, text="Flip camera input horizontally", variable=mirror_camera).grid(
-        row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-    def analyze_photo():
-        path = filedialog.askopenfilename(parent=root, title="Select a camera photo",
-                                          filetypes=(("Images", "*.jpg *.jpeg *.png *.bmp"), ("All files", "*.*")))
-        if not path:
-            return
-        try:
-            report = diagnostics.inspect_image(diagnostics.load_image(path), mirror_camera.get())
-            messagebox.showinfo("Photo diagnostics", report, parent=root)
-        except (OSError, ValueError, cv2.error) as exc:
-            messagebox.showerror("Photo diagnostics", str(exc), parent=root)
-
-    ttk.Button(options, text="Analyze camera photo...", command=analyze_photo).grid(
-        row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
-    modes = ttk.Frame(container)
-    modes.pack(fill="x", pady=(0, 8))
-    ttk.Checkbutton(modes, text="No ACK (select on both PCs)", variable=no_ack).grid(row=0, column=0, sticky="w")
-    ttk.Label(modes, text="Send profile").grid(row=0, column=1, padx=(10, 4))
-    ttk.Combobox(modes, textvariable=profile, values=tuple(p.name for p in visual.PROFILES),
-                 state="readonly", width=12).grid(row=0, column=2)
-    ttk.Checkbutton(modes, text="Debug loopback (sender)", variable=debug).grid(row=1, column=0, sticky="w")
-    ttk.Label(modes, text="Distortion").grid(row=1, column=1, padx=(10, 4))
-    ttk.Combobox(modes, textvariable=noise, values=tuple(simulation.LEVELS),
-                 state="readonly", width=12).grid(row=1, column=2)
-
-    files_box = ttk.LabelFrame(container, text="Sender: files in order", padding=8)
+    files_box = ttk.LabelFrame(container, text="Files in order", padding=8)
     files_box.pack(fill="both", expand=True)
     files_list = tk.Listbox(files_box, height=5, selectmode="extended")
     files_list.pack(side="left", fill="both", expand=True)
@@ -241,7 +241,7 @@ def main():
     file_buttons.pack(side="left", padx=(8, 0), anchor="n")
 
     def add_files():
-        for selected in filedialog.askopenfilenames(parent=root, title="Select files to send"):
+        for selected in filedialog.askopenfilenames(parent=container.winfo_toplevel(), title="Select files to send"):
             paths.append(selected)
             files_list.insert("end", selected)
 
@@ -252,6 +252,57 @@ def main():
 
     ttk.Button(file_buttons, text="Add files", command=add_files).pack(fill="x")
     ttk.Button(file_buttons, text="Remove", command=remove_files).pack(fill="x", pady=4)
+    return paths
+
+
+def main(resolution_override=None, profile_override=None):
+    root = create_root("ScreenTransfer setup" if resolution_override is None and profile_override is None
+                       else "ScreenTransfer debug transfer setup")
+    root.minsize(570, 430)
+    screen = (root.winfo_screenwidth(), root.winfo_screenheight())
+    role = tk.StringVar(value="send")
+    camera = tk.StringVar(value="0")
+    directory = tk.StringVar()
+    no_ack = tk.BooleanVar(value=False)
+    no_ack_profile = tk.StringVar(value=visual.PROFILES[
+        profile_override if profile_override is not None else visual.CONTROL_PROFILE].label)
+
+    container = ttk.Frame(root, padding=16)
+    container.pack(fill="both", expand=True)
+    ttk.Label(container, text="ScreenTransfer", font=("Segoe UI", 16, "bold")).pack(anchor="w")
+    ttk.Label(container, text="Set up both PCs. Rotation and mirroring are corrected automatically.").pack(anchor="w", pady=(2, 10))
+    roles = ttk.Frame(container)
+    roles.pack(fill="x")
+    ttk.Radiobutton(roles, text="Sender", variable=role, value="send").pack(side="left")
+    ttk.Radiobutton(roles, text="Receiver", variable=role, value="receive").pack(side="left", padx=12)
+
+    options = ttk.Frame(container)
+    options.pack(fill="x", pady=10)
+    ttk.Label(options, text="Camera index").grid(row=0, column=0, sticky="w")
+    ttk.Entry(options, textvariable=camera, width=6).grid(row=0, column=1, padx=(8, 24))
+    modes = ttk.Frame(container)
+    modes.pack(fill="x", pady=(0, 8))
+    ttk.Checkbutton(modes, text="No ACK (select on both PCs)", variable=no_ack).grid(row=0, column=0, sticky="w")
+    profile_label = ttk.Label(modes, text="Sender profile")
+    profile_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+    profile_box = ttk.Combobox(modes, textvariable=no_ack_profile,
+                              values=tuple(visual.PROFILES[i].label for i in visual.PROFILE_ORDER),
+                              state="readonly", width=34)
+    profile_box.grid(row=1, column=1, padx=8, pady=(6, 0))
+
+    def update_profile_visibility(*_):
+        if no_ack.get() and role.get() == "send":
+            profile_label.grid()
+            profile_box.grid()
+        else:
+            profile_label.grid_remove()
+            profile_box.grid_remove()
+
+    no_ack.trace_add("write", update_profile_visibility)
+    role.trace_add("write", update_profile_visibility)
+    update_profile_visibility()
+    ttk.Label(container, text="ACK: automatic density/timing. No ACK: start with Mono coarse. Dimensions are grid cells.").pack(anchor="w", pady=(0, 8))
+    paths = add_file_queue(container)
     dest = ttk.LabelFrame(container, text="Receiver: save folder", padding=8)
     dest.pack(fill="x", pady=10)
     ttk.Entry(dest, textvariable=directory).pack(side="left", fill="x", expand=True)
@@ -264,34 +315,56 @@ def main():
     ttk.Button(dest, text="Browse", command=choose_folder).pack(side="left", padx=(8, 0))
     ttk.Label(container, text="Maximum 3 MiB per file. Existing files are not overwritten. Esc stops a session.").pack(anchor="w")
 
+    def selected_camera():
+        index = int(camera.get())
+        if index < 0:
+            raise ValueError("Camera index must be non-negative")
+        return index
+
     def start():
         try:
-            if debug.get() and (role.get() != "send" or no_ack.get()):
-                raise ValueError("Debug loopback requires Sender and ACK mode.")
-            machine = None
-            index, dims = 0, (1280, 720)
-            if not debug.get():
-                if role.get() == "send":
-                    profile_id = next(i for i, item in enumerate(visual.PROFILES) if item.name == profile.get())
-                    machine = NoAckSender(paths, profile_id) if no_ack.get() else Sender(paths, time.monotonic())
-                else:
-                    machine = Receiver(directory.get(), no_ack=no_ack.get())
-                if not isinstance(machine, NoAckSender):
-                    index = int(camera.get())
-                    if index < 0:
-                        raise ValueError("Camera index must be non-negative")
-                    dims = tuple(int(v.strip()) for v in resolution.get().split("x"))
-                    if len(dims) != 2:
-                        raise ValueError("Invalid camera resolution")
+            if role.get() == "send":
+                selected = next(i for i, profile in enumerate(visual.PROFILES) if profile.label == no_ack_profile.get())
+                machine = (NoAckSender(paths, selected)
+                           if no_ack.get() else Sender(paths, time.monotonic(), max_profile=profile_override))
+            else:
+                machine = Receiver(directory.get(), no_ack=no_ack.get())
+            index = 0 if isinstance(machine, NoAckSender) else selected_camera()
             root.withdraw()
             root.update()
-            result = (run_debug(paths, noise.get(), screen) if debug.get()
-                      else run_link(machine, index, dims, screen, mirror_camera.get()))
+            result = run_link(machine, index, resolution_override, screen)
             root.deiconify()
             messagebox.showinfo("ScreenTransfer", result, parent=root)
         except (OSError, ValueError, RuntimeError, cv2.error) as exc:
             root.deiconify()
             messagebox.showerror("ScreenTransfer", str(exc), parent=root)
 
+    def calibrate():
+        sending = role.get() == "send"
+        result = None
+        try:
+            index = 0 if sending else selected_camera()
+            root.withdraw()
+            root.update()
+            if sending:
+                show_calibration(screen)
+            else:
+                result = take_calibration(index, resolution_override)
+        except (ValueError, RuntimeError, cv2.error) as exc:
+            root.deiconify()
+            messagebox.showerror("ScreenTransfer calibration", str(exc), parent=root)
+        else:
+            root.deiconify()
+            if result is not None:
+                messagebox.showinfo("ScreenTransfer calibration", result, parent=root)
+
+    calibration_button = ttk.Button(container, command=calibrate)
+    calibration_button.pack(anchor="w", pady=(12, 0))
+
+    def label_calibration_button(*_):
+        calibration_button.configure(text="Show calib imgs" if role.get() == "send" else "Take calib")
+
+    role.trace_add("write", label_calibration_button)
+    label_calibration_button()
     ttk.Button(container, text="Start", command=start).pack(anchor="e", pady=(12, 0))
     root.mainloop()

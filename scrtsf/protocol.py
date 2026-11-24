@@ -8,8 +8,8 @@ import zlib
 from pathlib import Path
 
 MAX_FILE = 3 * 1024 * 1024
-BLOCK = 512
-WINDOW = 32
+BLOCK = 128
+WINDOW = 64
 HEADER = struct.Struct("!4sB8sIH")
 CRC = struct.Struct("!I")
 MAGIC = b"STF1"
@@ -62,6 +62,7 @@ def prepare(path: Path):
         "length": len(content),
         "compressed": use_compression,
         "sha256": hashlib.sha256(data).hexdigest(),
+        "block": BLOCK,
     }
     return meta, content
 
@@ -69,6 +70,7 @@ def prepare(path: Path):
 def validate_meta(meta):
     name = meta.get("name")
     size, length = meta.get("size"), meta.get("length")
+    block = meta.get("block", 512)
     digest, compressed = meta.get("sha256"), meta.get("compressed")
     if not isinstance(name, str) or not name or len(name.encode("utf-8")) > 255:
         raise ValueError("Invalid file name")
@@ -82,6 +84,22 @@ def validate_meta(meta):
         raise ValueError("Invalid file size")
     if type(compressed) is not bool or not isinstance(digest, str) or len(digest) != 64:
         raise ValueError("Invalid file metadata")
+    if type(block) is not int or block not in (128, 512):
+        raise ValueError("Invalid block size")
+    for key, limit in (("queue_blocks", 64 * (MAX_FILE // 128)),
+                       ("file_index", 64), ("file_count", 64)):
+        if key in meta and (type(meta[key]) is not int or not 1 <= meta[key] <= limit):
+            raise ValueError("Invalid queue metadata")
+    if "file_index" in meta and "file_count" in meta and meta["file_index"] > meta["file_count"]:
+        raise ValueError("Invalid file index")
+    if "queue_id" in meta:
+        queue_id = meta["queue_id"]
+        if not isinstance(queue_id, str) or len(queue_id) != 16:
+            raise ValueError("Invalid queue ID")
+        try:
+            bytes.fromhex(queue_id)
+        except ValueError as exc:
+            raise ValueError("Invalid queue ID") from exc
     try:
         bytes.fromhex(digest)
     except ValueError as exc:
@@ -92,14 +110,15 @@ class Incoming:
     def __init__(self, meta):
         validate_meta(meta)
         self.meta = meta
-        self.count = math.ceil(meta["length"] / BLOCK)
+        self.block_size = meta.get("block", 512)
+        self.count = math.ceil(meta["length"] / self.block_size)
         self.blocks = [None] * self.count
         self.received = 0
 
     def add(self, index: int, data: bytes):
         if not 0 <= index < self.count:
             raise ValueError("Invalid block index")
-        expected = min(BLOCK, self.meta["length"] - index * BLOCK)
+        expected = min(self.block_size, self.meta["length"] - index * self.block_size)
         if len(data) != expected:
             raise ValueError("Invalid block length")
         if self.blocks[index] is None:

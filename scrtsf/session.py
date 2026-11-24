@@ -2,35 +2,99 @@
 
 import os
 import struct
+import time
 import zlib
+from collections import deque
 from pathlib import Path
 
 from . import protocol as p
-from .visual import PROFILES
+from .calibration import CAL_CONTROL, FRAME_SECONDS, Calibration, TrialReceiver
+from .visual import CONTROL_PROFILE, PROFILE_ORDER, PROFILES
 
 ENTRY = struct.Struct("!IH")
 CAL_SECONDS = 5.0
-FRAME_SECONDS = 0.4
 MAX_QUEUE_BYTES = 32 * 1024 * 1024
 MAX_QUEUE_FILES = 64
 NO_ACK_META, NO_ACK_DATA = 7, 8
+META_FRAGMENT, NO_ACK_META_FRAGMENT = 9, 10
+FRAGMENT = struct.Struct("!HH")
+MAX_METADATA = 1024
+
+
+def short_name(name):
+    return name if len(name) <= 20 else name[:17] + "..."
+
+
+def metadata_fragment(meta, index):
+    data = p.encode_json(meta)
+    if len(data) > MAX_METADATA:
+        raise ValueError("File metadata is too large")
+    size = PROFILES[CONTROL_PROFILE].capacity - FRAGMENT.size
+    offset = index * size % (((len(data) + size - 1) // size) * size)
+    return FRAGMENT.pack(offset, len(data)) + data[offset:offset + size]
+
+
+class MetadataBuffer:
+    def __init__(self):
+        self.sessions = {}
+
+    def add(self, session, payload):
+        if len(payload) <= FRAGMENT.size:
+            raise ValueError("Short metadata fragment")
+        offset, total = FRAGMENT.unpack_from(payload)
+        content = payload[FRAGMENT.size:]
+        if not (0 < total <= MAX_METADATA and offset + len(content) <= total):
+            raise ValueError("Invalid metadata fragment")
+        if session not in self.sessions:
+            if len(self.sessions) >= MAX_QUEUE_FILES:
+                raise ValueError("Too many metadata sessions")
+            self.sessions[session] = (total, {})
+        size, parts = self.sessions[session]
+        if size != total:
+            raise ValueError("Conflicting metadata length")
+        for index, byte in enumerate(content, offset):
+            if index in parts and parts[index] != byte:
+                raise ValueError("Conflicting metadata fragment")
+            parts[index] = byte
+        if len(parts) == total:
+            data = bytes(parts[index] for index in range(total))
+            del self.sessions[session]
+            return data
+        return None
+
+
+def prepare_queue(paths):
+    paths = [Path(path) for path in paths]
+    if not paths or len(paths) > MAX_QUEUE_FILES:
+        raise ValueError(f"Select between 1 and {MAX_QUEUE_FILES} files")
+    files, names = [], set()
+    total = 0
+    for path in paths:
+        meta, content = p.prepare(path)
+        p.validate_meta(meta)
+        name = meta["name"].casefold()
+        if name in names:
+            raise ValueError(f"Duplicate file name in queue: {meta['name']}")
+        names.add(name)
+        total += len(content)
+        if total > MAX_QUEUE_BYTES:
+            raise ValueError("Compressed queue exceeds the 32 MiB limit")
+        files.append((os.urandom(8), meta, content))
+    queue_blocks = sum(max(1, (len(content) + p.BLOCK - 1) // p.BLOCK) for _, _, content in files)
+    queue_id = os.urandom(8).hex()
+    for index, (_, meta, _) in enumerate(files):
+        meta.update(queue_blocks=queue_blocks, file_index=index + 1, file_count=len(files), queue_id=queue_id)
+        if len(p.encode_json(meta)) > MAX_METADATA:
+            raise ValueError("File metadata is too large")
+    return paths, files
 
 
 class Sender:
-    def __init__(self, paths, now):
-        self.paths = [Path(path) for path in paths]
-        if not self.paths:
-            raise ValueError("Select at least one file")
-        for path in self.paths:
-            if not path.is_file() or path.stat().st_size > p.MAX_FILE:
-                raise ValueError(f"Not a file or larger than 3 MiB: {path}")
+    def __init__(self, paths, now, max_profile=None):
+        self.paths, self.files = prepare_queue(paths)
         self.session = os.urandom(8)
         self.state = "hello"
-        self.cal_start = now
-        self.cal_profile = 0
-        self.sent = [0] * len(PROFILES)
-        self.seen = [0] * len(PROFILES)
-        self.profile = 0
+        self.profile = CONTROL_PROFILE
         self.file_index = -1
         self.base = 0
         self.mask = 0
@@ -40,52 +104,68 @@ class Sender:
         self.seq = 0
         self.message = "Point both webcams at the opposite screen"
         self.done = False
+        self.frame_interval = FRAME_SECONDS
+        self.last_ack = now
+        self.calibration = None
+        self.resuming = False
+        self.confirmed_queue = 0
+        self.total_queue = sum(max(1, (len(content) + p.BLOCK - 1) // p.BLOCK) for _, _, content in self.files)
+        self.file_started = now
+        self.last_tuning = now
+        self.expected_rate = 0
+        self.progress_samples = deque([(now, 0)], maxlen=128)
+        if max_profile is not None and max_profile not in PROFILE_ORDER:
+            raise ValueError("Invalid profile")
+        self.profile_order = (PROFILE_ORDER if max_profile is None else
+                              PROFILE_ORDER[:PROFILE_ORDER.index(max_profile) + 1])
 
     def next_file(self, now):
+        if self.file_index >= 0:
+            self.confirmed_queue += max(1, (len(self.content) + p.BLOCK - 1) // p.BLOCK)
         self.file_index += 1
         if self.file_index == len(self.paths):
             self.state = "end"
             return
-        self.meta, self.content = p.prepare(self.paths[self.file_index])
-        p.validate_meta(self.meta)
-        if len(p.encode_json(self.meta)) > PROFILES[0].capacity:
-            raise ValueError("File metadata is too large")
-        self.session = os.urandom(8)
+        self.session, self.meta, self.content = self.files[self.file_index]
         self.state = "meta"
         self.received = 0
         self.last_progress = now
         self.base = self.mask = self.cursor = 0
+        self.meta_index = 0
+        self.file_started = now
+        self.last_tuning = now
+        self.progress_samples.clear()
+        self.progress_samples.append((now, 0))
+
+    def start_calibration(self, resuming=False):
+        self.calibration = Calibration(self.profile_order, CAL_SECONDS)
+        self.state = "cal"
+        self.resuming = resuming
+        self.message = "Recalibrating without discarding blocks" if resuming else "Calibrating"
 
     def frame(self, now):
         self.seq = (self.seq + 1) & 0xFFFFFFFF
         if self.state == "hello":
-            return 0, p.packet(p.HELLO, self.session, self.seq)
+            return CONTROL_PROFILE, p.packet(p.HELLO, self.session, self.seq)
         if self.state == "cal":
-            elapsed = now - self.cal_start
-            stage = min(int(elapsed // CAL_SECONDS), len(PROFILES) - 1)
-            if elapsed >= CAL_SECONDS * len(PROFILES):
-                choices = [i for i in range(len(PROFILES))
-                           if self.sent[i] and self.seen[i] / self.sent[i] >= 0.6]
-                if not choices:
-                    self.message = "Calibration failed; improve camera position"
-                    self.state = "hello"
-                    self.session = os.urandom(8)
-                    return 0, p.packet(p.HELLO, self.session, self.seq)
-                self.profile = max(choices, key=lambda i: self.seen[i] / self.sent[i] *
-                                   max(1, PROFILES[i].capacity // (p.BLOCK + ENTRY.size)))
-                self.next_file(now)
-                return self.frame(now)
-            self.cal_profile = stage
-            self.sent[stage] += 1
-            data = os.urandom(PROFILES[stage].capacity)
-            return stage, p.packet(p.CAL, self.session, self.seq, data)
+            result = self.calibration.frame(self.session, self.seq, now)
+            self.frame_interval = self.calibration.interval
+            return result
         if self.state == "meta":
-            return 0, p.packet(p.META, self.session, self.seq, p.encode_json(self.meta))
+            self.frame_interval = FRAME_SECONDS
+            payload = metadata_fragment(self.meta, self.meta_index)
+            self.meta_index += 1
+            return CONTROL_PROFILE, p.packet(META_FRAGMENT, self.session, self.seq, payload)
         if self.state == "data":
-            if self.profile > 0 and now - self.last_progress > 15:
-                self.profile -= 1
-                self.last_progress = now
-                self.message = "Link slowed; switching to a more robust profile"
+            while len(self.progress_samples) > 1 and self.progress_samples[1][0] <= now - 10:
+                self.progress_samples.popleft()
+            first_time, first_count = self.progress_samples[0]
+            recent_rate = (self.received - first_count) * p.BLOCK / max(1, now - first_time)
+            deteriorated = now - self.last_tuning >= 30 and self.expected_rate > 0 and recent_rate < self.expected_rate * 0.4
+            if (now - self.last_progress > 15 or deteriorated) and now - self.last_ack < 8:
+                self.start_calibration(resuming=True)
+                return self.frame(now)
+            self.frame_interval = self.data_interval
             indices = [self.base + i for i in range(p.WINDOW) if self.mask & (1 << i)]
             payload = bytearray()
             if indices:
@@ -100,7 +180,8 @@ class Sender:
                     self.cursor += 1
             return self.profile, p.packet(p.DATA, self.session, self.seq, bytes(payload))
         if self.state == "end":
-            return 0, p.packet(p.END, self.session, self.seq)
+            self.frame_interval = FRAME_SECONDS
+            return CONTROL_PROFILE, p.packet(p.END, self.session, self.seq)
         raise RuntimeError(f"Unknown sender state: {self.state}")
 
     def handle(self, decoded, now):
@@ -108,20 +189,26 @@ class Sender:
         if kind != p.STATUS or session != self.session:
             return
         status = p.decode_json(payload)
+        self.last_ack = now
         state = status.get("state")
         if state == "error":
             raise RuntimeError("Receiver: " + str(status.get("message", "unknown error")))
         if self.state == "hello" and state == "hello":
-            self.state = "cal"
-            self.cal_start = now
-            self.sent = [0] * len(PROFILES)
-            self.seen = [0] * len(PROFILES)
-            self.message = "Calibrating"
+            self.start_calibration()
         elif self.state == "cal" and state == "cal":
-            counts = status.get("counts")
-            if isinstance(counts, list) and len(counts) == len(PROFILES) and all(type(n) is int and n >= 0 for n in counts):
-                self.seen = counts
-        elif self.state in ("meta", "data") and state == "receiving":
+            self.calibration.handle(status)
+            if self.calibration.done:
+                self.profile, self.data_interval = self.calibration.selected
+                self.expected_rate = self.calibration.confirmed_rate
+                self.last_tuning = now
+                self.progress_samples.clear()
+                self.progress_samples.append((now, self.received))
+                self.last_progress = now
+                if self.resuming:
+                    self.state = "data"
+                else:
+                    self.next_file(now)
+        elif self.state in ("meta", "data") and state in ("receiving", "verifying"):
             base, mask, received = status.get("base"), status.get("mask"), status.get("received")
             count = (len(self.content) + p.BLOCK - 1) // p.BLOCK
             if any(type(n) is not int for n in (base, mask, received)) or not (0 <= base <= count and 0 <= mask < 2 ** p.WINDOW and 0 <= received <= count):
@@ -131,6 +218,7 @@ class Sender:
             if received > self.received:
                 self.received = received
                 self.last_progress = now
+                self.progress_samples.append((now, received))
             self.base, self.mask = base, mask
             self.state = "data"
         elif self.state in ("meta", "data") and state == "complete":
@@ -140,37 +228,31 @@ class Sender:
 
     def label(self):
         if self.state == "cal":
-            return f"Calibrating: {PROFILES[self.cal_profile].name} | Keep both screens visible | Esc: stop"
+            return self.calibration.label()
         if self.state in ("meta", "data"):
             total = (len(self.content) + p.BLOCK - 1) // p.BLOCK
-            return f"Sending {self.file_index + 1}/{len(self.paths)}: {self.paths[self.file_index].name} | {self.received}/{total} blocks | {PROFILES[self.profile].name} | Esc: stop"
-        return f"{self.message} | {self.state} | Esc: stop"
+            file_percent = self.received / total * 100 if total else 0
+            queue = (self.confirmed_queue + self.received) / self.total_queue * 100
+            rate = self.received * p.BLOCK / max(0.001, self.last_ack - self.file_started)
+            eta = (total - self.received) * p.BLOCK / rate if rate else None
+            remaining = f"~{eta:.0f}s" if eta is not None else "?"
+            return (f"Send {self.file_index + 1}/{len(self.paths)} {short_name(self.paths[self.file_index].name)} | "
+                    f"File {file_percent:.1f}% queue {queue:.1f}% | {self.received}/{total}b ACK | "
+                    f"{rate / 1024:.1f}K/s ETA {remaining}")
+        percent = self.confirmed_queue / self.total_queue * 100 if self.total_queue else 0
+        if self.state == "hello":
+            return "Waiting for peer"
+        return f"{self.state} | queue {percent:.1f}% | {self.confirmed_queue}/{self.total_queue}b ACK"
 
 
 class NoAckSender:
     """Continuously cycle a queue without relying on a return channel."""
 
-    def __init__(self, paths, profile=0):
-        if not paths or len(paths) > MAX_QUEUE_FILES:
-            raise ValueError(f"Select between 1 and {MAX_QUEUE_FILES} files")
+    def __init__(self, paths, profile=CONTROL_PROFILE):
         if not 0 <= profile < len(PROFILES):
             raise ValueError("Invalid profile")
-        self.files = []
-        names = set()
-        total = 0
-        for path in map(Path, paths):
-            meta, content = p.prepare(path)
-            p.validate_meta(meta)
-            if len(p.encode_json(meta)) > PROFILES[0].capacity:
-                raise ValueError("File metadata is too large")
-            name = meta["name"].casefold()
-            if name in names:
-                raise ValueError(f"Duplicate file name in queue: {meta['name']}")
-            names.add(name)
-            total += len(content)
-            if total > MAX_QUEUE_BYTES:
-                raise ValueError("Compressed queue exceeds the 32 MiB limit")
-            self.files.append((os.urandom(8), meta, content))
+        _, self.files = prepare_queue(paths)
+        self.frame_interval = FRAME_SECONDS
         self.profile = profile
         self.file_index = 0
         self.seq = 0
@@ -179,19 +261,28 @@ class NoAckSender:
         self.cycle = 0
         self.message = ""
         self.display_label = ""
+        self.meta_index = 0
+        self.cycle_blocks = 0
+        self.total_blocks = sum(max(1, (len(content) + p.BLOCK - 1) // p.BLOCK) for _, _, content in self.files)
 
     def frame(self, now):
         del now
         self.seq = (self.seq + 1) & 0xFFFFFFFF
         session, meta, content = self.files[self.file_index]
         count = (len(content) + p.BLOCK - 1) // p.BLOCK
-        self.display_label = (f"No ACK | cycle {self.cycle + 1} | {self.file_index + 1}/{len(self.files)} "
-                              f"{meta['name']} | sent {self.offset}/{count} blocks | Esc: stop")
-        if self.phase % 10 == 0:
+        self.update_label(meta, count)
+        fragment_size = PROFILES[CONTROL_PROFILE].capacity - FRAGMENT.size
+        fragment_count = (len(p.encode_json(meta)) + fragment_size - 1) // fragment_size
+        metadata_frames = max(2, fragment_count) + self.cycle % 2
+        if self.phase < metadata_frames or self.phase % 10 == 0:
+            payload = metadata_fragment(meta, self.meta_index)
+            self.meta_index += 1
             self.phase += 1
-            if count == 0:
+            if count == 0 and self.phase >= metadata_frames:
+                self.cycle_blocks += 1
+                self.update_label(meta, count)
                 self._advance()
-            return 0, p.packet(NO_ACK_META, session, self.seq, p.encode_json(meta))
+            return CONTROL_PROFILE, p.packet(NO_ACK_META_FRAGMENT, session, self.seq, payload)
         payload = bytearray()
         while self.offset < count:
             index = (self.offset + self.cycle) % count
@@ -201,7 +292,9 @@ class NoAckSender:
                 break
             payload.extend(entry)
             self.offset += 1
+            self.cycle_blocks += 1
         self.phase += 1
+        self.update_label(meta, count)
         if self.offset == count:
             self._advance()
         return self.profile, p.packet(NO_ACK_DATA, session, self.seq, bytes(payload))
@@ -213,6 +306,12 @@ class NoAckSender:
         if self.file_index == len(self.files):
             self.file_index = 0
             self.cycle += 1
+            self.cycle_blocks = 0
+        self.meta_index = self.cycle
+
+    def update_label(self, meta, count):
+        self.display_label = (f"No ACK c{self.cycle + 1} | {self.file_index + 1}/{len(self.files)} {short_name(meta['name'])} | "
+                              f"cycle {self.cycle_blocks / self.total_blocks * 100:.1f}% {self.offset}/{count}b | Delivery unconfirmed")
 
     def label(self):
         return self.display_label
@@ -235,6 +334,14 @@ class Receiver:
         self.transfers = {}
         self.completed = set()
         self.queue_bytes = 0
+        self.metadata = MetadataBuffer()
+        self.calibration = None
+        self.cal_active = False
+        self.frame_interval = FRAME_SECONDS
+        self.pending = []
+        self.verification_announced = False
+        self.saved_blocks = 0
+        self.file_started = None
 
     def handle_no_ack(self, kind, session, payload):
         if kind == NO_ACK_META:
@@ -250,16 +357,19 @@ class Receiver:
                 return
             self.transfers[session] = incoming
             self.queue_bytes += meta["length"]
+            self.incoming = incoming
             if not incoming.count:
                 self._finish_no_ack(session)
         elif kind == NO_ACK_DATA and session in self.transfers:
             incoming = self.transfers[session]
-            if session in self.completed:
+            if session in self.completed or any(item[0] == session for item in self.pending):
                 return
+            self.incoming = incoming
             for index, block in parse_entries(payload):
                 incoming.add(index, block)
             if incoming.received == incoming.count:
-                self._finish_no_ack(session)
+                self.pending.append((session, incoming))
+                self.state = "verifying"
 
     def _finish_no_ack(self, session):
         incoming = self.transfers[session]
@@ -272,33 +382,61 @@ class Receiver:
         self.completed.add(session)
         self.saved.append(path)
         self.message = f"Saved {path.name}"
+        self.state = "waiting"
 
     def handle(self, decoded):
         profile, (kind, session, seq, payload) = decoded
+        if kind in (META_FRAGMENT, NO_ACK_META_FRAGMENT):
+            if (kind == NO_ACK_META_FRAGMENT) != self.no_ack:
+                return
+            payload = self.metadata.add(session, payload)
+            if payload is None:
+                return
+            kind = NO_ACK_META if self.no_ack else p.META
         if self.no_ack:
             if self.state != "error":
                 self.handle_no_ack(kind, session, payload)
+            return
+        if kind == CAL_CONTROL and session == self.session:
+            if self.calibration is None:
+                self.calibration = TrialReceiver()
+            self.calibration.control(payload, seq)
+            self.cal_active = self.calibration.trial is not None
             return
         if kind == p.HELLO:
             if self.state in ("waiting", "hello", "cal"):
                 if session != self.session:
                     self.counts = [set() for _ in PROFILES]
+                    self.calibration = None
+                    self.cal_active = False
                 self.session, self.state = session, "hello"
         elif kind == p.CAL and session == self.session and self.state in ("hello", "cal"):
-            self.state = "cal"
-            self.counts[profile].add(seq)
+            if self.calibration is not None:
+                self.calibration.add(profile, payload)
+            else:
+                self.state = "cal"
+                self.counts[profile].add(seq)
+        elif kind == p.CAL and session == self.session and self.cal_active:
+            self.calibration.add(profile, payload)
         elif kind == p.META:
             if session != self.session and self.state in ("hello", "cal", "complete"):
                 meta = p.decode_json(payload)
                 incoming = p.Incoming(meta)
+                if self.incoming and self.incoming.meta.get("queue_id") != meta.get("queue_id"):
+                    self.saved_blocks = 0
                 self.session, self.incoming, self.state = session, incoming, "receiving"
+                self.cal_active = False
+                self.calibration = None
+                self.file_started = time.monotonic()
                 if incoming.count == 0:
                     self.finish()
         elif kind == p.DATA and session == self.session and self.state == "receiving":
+            self.cal_active = False
             for index, block in parse_entries(payload):
                 self.incoming.add(index, block)
             if self.incoming.received == self.incoming.count:
-                self.finish()
+                self.state = "verifying"
+                self.pending.append((session, self.incoming))
         elif kind == p.END and session == self.session and self.state == "complete":
             self.state = "end"
             self.message = "All files received. Press Esc to close."
@@ -311,28 +449,66 @@ class Receiver:
             self.message = str(exc)
             return
         self.saved.append(path)
+        self.saved_blocks += max(1, self.incoming.count)
         self.state = "complete"
         self.message = f"Saved {path.name}"
 
     def frame(self):
+        if self.pending and self.state != "error":
+            if not self.verification_announced:
+                self.verification_announced = True
+            else:
+                session, _ = self.pending.pop(0)
+                self.verification_announced = False
+                if self.no_ack:
+                    self._finish_no_ack(session)
+                else:
+                    self.finish()
         status = {"state": self.state}
-        if self.state == "cal":
+        if self.cal_active and self.calibration is not None:
+            status = self.calibration.status()
+        elif self.state == "cal":
             status["counts"] = [len(items) for items in self.counts]
-        elif self.state == "receiving":
+        elif self.state in ("receiving", "verifying"):
             base, mask = self.incoming.missing_window()
             status.update(base=base, mask=mask, received=self.incoming.received)
         elif self.state == "error":
             status["message"] = self.message[:200]
-        return 0, p.packet(p.STATUS, self.session, 0, p.encode_json(status))
+        payload = p.encode_json(status)
+        while len(payload) > PROFILES[CONTROL_PROFILE].capacity and "message" in status:
+            status["message"] = status["message"][:len(status["message"]) // 2]
+            payload = p.encode_json(status)
+        return CONTROL_PROFILE, p.packet(p.STATUS, self.session, 0, payload)
 
     def label(self):
+        if self.cal_active and self.calibration is not None:
+            trial = self.calibration
+            return f"Cal {PROFILES[trial.profile].name} | {len(trial.seen)}/{trial.frames} images | ACK {trial.phase}"
         if self.no_ack:
             active = sum(item.received for session, item in self.transfers.items() if session not in self.completed)
             total = sum(item.count for session, item in self.transfers.items() if session not in self.completed)
-            return f"No ACK | {len(self.saved)} saved | {active}/{total} blocks | {self.message} | Esc: stop"
-        if self.state == "receiving":
-            return f"Receiving {self.incoming.meta['name']} | {self.incoming.received}/{self.incoming.count} blocks | Esc: stop"
-        return f"{self.state}: {self.message} | Esc: stop"
+            queue_id = self.incoming.meta.get("queue_id") if self.incoming else None
+            received = sum(max(1, item.count) if session in self.completed else item.received
+                           for session, item in self.transfers.items() if item.meta.get("queue_id") == queue_id)
+            denominator = self.incoming.meta.get("queue_blocks") if self.incoming else None
+            percent = f"{received / denominator * 100:.1f}%" if denominator else "unknown extent"
+            current = self.pending[0][1] if self.pending else self.incoming
+            file_info = (f"{short_name(current.meta['name'])} | File {current.received / max(1, current.count) * 100:.1f}%"
+                         if current else "Waiting for file metadata")
+            return f"No ACK {file_info} queue {percent} | {active}/{total}b | {len(self.saved)} saved | {self.state}"
+        if self.state in ("receiving", "verifying", "complete") and self.incoming:
+            count = self.incoming.count
+            percent = self.incoming.received / count * 100 if count else 100
+            denominator = self.incoming.meta.get("queue_blocks")
+            confirmed = self.saved_blocks if self.state == "complete" else self.saved_blocks + self.incoming.received
+            queue = f"{confirmed / denominator * 100:.1f}%" if denominator else "unknown extent"
+            elapsed = max(0.001, time.monotonic() - self.file_started) if self.file_started is not None else 0
+            rate = self.incoming.received * self.incoming.block_size / elapsed if elapsed else 0
+            eta = (count - self.incoming.received) * self.incoming.block_size / rate if rate else None
+            remaining = f"~{eta:.0f}s" if eta is not None else "?"
+            return (f"{self.state} {short_name(self.incoming.meta['name'])} | File {percent:.1f}% queue {queue} | "
+                    f"{self.incoming.received}/{count}b | {rate / 1024:.1f}K/s ETA {remaining}")
+        return f"{self.state}: {self.message}"
 
 
 def parse_entries(payload):

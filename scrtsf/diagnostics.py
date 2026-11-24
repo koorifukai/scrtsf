@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 
 from . import protocol, visual
-from .session import NO_ACK_DATA, NO_ACK_META
+from .calibration import CAL_PATTERN
+from .session import META_FRAGMENT, NO_ACK_DATA, NO_ACK_META, NO_ACK_META_FRAGMENT
 
 
 def load_image(path):
@@ -15,20 +16,17 @@ def load_image(path):
     return image
 
 
-def inspect_image(image, mirror=False):
-    frame = cv2.flip(image, 1) if mirror else image
-    _, ids, _ = visual.DETECTOR.detectMarkers(frame)
-    marker_ids = [] if ids is None else sorted(int(value) for value in ids.flatten())
+def inspect_image(image):
+    frame = image
     height, width = frame.shape[:2]
     lines = [
         f"Image: {width} x {height} pixels",
-        f"Camera input flip: {'on' if mirror else 'off'}",
-        f"Marker IDs detected: {', '.join(map(str, marker_ids)) if marker_ids else 'none'}",
+        "Orientation: automatic rotation and reflection correction",
     ]
     try:
         profile_id, src, warped = visual.locate(frame)
     except ValueError as exc:
-        lines.extend([f"Grid: {exc}", "Try the camera input flip, reposition the camera, or improve focus and lighting."])
+        lines.extend([f"Grid: {exc}", "Keep all four anchors visible; improve focus and lighting."])
         return "\n".join(lines)
     profile = visual.PROFILES[profile_id]
     top = np.linalg.norm(src[1] - src[0])
@@ -45,11 +43,14 @@ def inspect_image(image, mirror=False):
     data_samples = flat[:encoded_bits]
     low, high = np.percentile(data_samples, [15, 85])
     lines.extend([
+        f"Marker IDs detected: {', '.join(str(profile_id * 4 + i) for i in range(4))}",
         f"Profile: {profile.name} ({profile.cols} x {profile.rows} cells)",
         f"Approximate camera pixels per cell: {horizontal:.1f} horizontal, {vertical:.1f} vertical",
         f"Data-cell brightness percentiles: {low:.0f} to {high:.0f} (0-255)",
         f"Unused padding: {total_bits - encoded_bits} of {total_bits} cell bits; a dark strip can be normal.",
     ])
+    if min(horizontal, vertical) < 3.5:
+        lines.append("Small cells: move closer or select a lower-density sender profile.")
     try:
         decoded_profile, packet = visual.decode(frame)
     except ValueError as exc:
@@ -58,7 +59,9 @@ def inspect_image(image, mirror=False):
     else:
         names = {protocol.HELLO: "hello", protocol.CAL: "calibration", protocol.META: "metadata",
                  protocol.DATA: "data", protocol.STATUS: "status", protocol.END: "end",
-                 NO_ACK_META: "no-ACK metadata", NO_ACK_DATA: "no-ACK data"}
+                 NO_ACK_META: "no-ACK metadata", NO_ACK_DATA: "no-ACK data",
+                 META_FRAGMENT: "metadata fragment", NO_ACK_META_FRAGMENT: "no-ACK metadata fragment",
+                 CAL_PATTERN: "standalone calibration"}
         kind = names.get(packet[0], f"type {packet[0]}")
         lines.append(f"Packet: decoded and CRC verified ({kind}; profile {visual.PROFILES[decoded_profile].name})")
     return "\n".join(lines)
